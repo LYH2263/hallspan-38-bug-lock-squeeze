@@ -96,8 +96,9 @@ function isViol(cell: any) {
 }
 function isLocked(cell: any) {
   if (cell.empty) return false
-  // 以当前锁表为准；历史方案自带的 locked 标记兜底
-  return false
+  // 图上带锁格与锁名单、统计锁定同一套数：以当前锁表为准
+  const id = cell.candidate_id ?? cell.id
+  return id != null && lockMap.value.has(id)
 }
 function paperClass(pid: number) {
   return pid % 2 === 0 ? 'b' : 'a'

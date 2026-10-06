@@ -84,17 +84,9 @@ def latest(hall_id: int = 1, db: Session = Depends(get_db)):
     plan = db.scalars(select(SeatPlan).where(SeatPlan.hall_id == hall_id).order_by(SeatPlan.id.desc())).first()
     if not plan:
         return run_seating(hall_id=hall_id, db=db)
-    # 原样返回历史快照：当前锁表不得回刷历史方案上的锁标记
-    data = json.loads(plan.result_json)
-    live = _current_locks(db, hall_id)
-    data["locks"] = [{"candidate_id": x.candidate_id, "row": x.row, "col": x.col} for x in live]
-    live_ids = {x.candidate_id for x in live}
-    for row in data.get("assignments") or []:
-        row["locked"] = row.get("candidate_id") in live_ids
-    stats = dict(data.get("stats") or {})
-    stats["locked"] = len(live_ids)
-    data["stats"] = stats
-    return {"id": plan.id, **data}
+    # 原样返回历史快照：锁标记、锁名单、统计都是落方案那一刻的数，
+    # 当前锁表的增删绝不回刷已落下的方案
+    return {"id": plan.id, **json.loads(plan.result_json)}
 
 
 @router.get("/violations")
@@ -105,8 +97,12 @@ def violations(hall_id: int = 1, db: Session = Depends(get_db)):
 
 @router.get("/stats")
 def stats(hall_id: int = 1, db: Session = Depends(get_db)):
+    _hall_or_404(db, hall_id)
     data = latest(hall_id=hall_id, db=db)
-    return {"hall_id": hall_id, **mix_stats(data)}
+    out = mix_stats(data)
+    # 统计锁定人数与当前锁名单同一套数（图上带锁格也按当前锁表渲染）
+    out["locked"] = len(_current_locks(db, hall_id))
+    return {"hall_id": hall_id, **out}
 
 
 @router.get("/locks")
@@ -120,12 +116,25 @@ def list_locks(hall_id: int = 1, db: Session = Depends(get_db)):
 @router.post("/locks")
 def add_lock(body: LockIn, hall_id: int = 1, db: Session = Depends(get_db)):
     hall = _hall_or_404(db, hall_id)
-    _candidate_or_404(db, hall_id, body.candidate_id)
+    cand = _candidate_or_404(db, hall_id, body.candidate_id)
+    # 全部校验先于任何写入：任一项失败，锁名单、方案、统计都原样不动
     if not (0 <= body.row < hall.rows and 0 <= body.col < hall.cols):
         raise HTTPException(422, f"格位 ({body.row},{body.col}) 越出 {hall.rows}x{hall.cols} 考室网格")
     same_cell = db.scalars(
         select(SeatLock).where(SeatLock.hall_id == hall_id, SeatLock.row == body.row, SeatLock.col == body.col)
     ).first()
+    if same_cell and same_cell.candidate_id != body.candidate_id:
+        raise HTTPException(409, f"该格已锁定给考生 {same_cell.candidate_id}，一格只能锁一人")
+    # 考生必须当前就坐在该格（以最新方案为准）；找不到人或人没坐在那格，整请求失败
+    plan = db.scalars(select(SeatPlan).where(SeatPlan.hall_id == hall_id).order_by(SeatPlan.id.desc())).first()
+    seated = None
+    if plan:
+        snap = json.loads(plan.result_json)
+        seated = next((a for a in snap.get("assignments") or []
+                       if a.get("candidate_id") == body.candidate_id), None)
+    if seated is None or (seated.get("row"), seated.get("col")) != (body.row, body.col):
+        raise HTTPException(409, f"考生 {cand.name} 当前未坐在 ({body.row},{body.col}) 格"
+                                 "（方案可能已更新），未写入任何锁定")
     existing = db.scalars(
         select(SeatLock).where(SeatLock.hall_id == hall_id, SeatLock.candidate_id == body.candidate_id)
     ).first()
@@ -134,15 +143,7 @@ def add_lock(body: LockIn, hall_id: int = 1, db: Session = Depends(get_db)):
     else:
         db.add(SeatLock(hall_id=hall_id, candidate_id=body.candidate_id, row=body.row, col=body.col))
     db.commit()
-    plan = db.scalars(select(SeatPlan).where(SeatPlan.hall_id == hall_id).order_by(SeatPlan.id.desc())).first()
-    if plan:
-        snap = json.loads(plan.result_json)
-        live = _current_locks(db, hall_id)
-        snap["locks"] = [{"candidate_id": x.candidate_id, "row": x.row, "col": x.col} for x in live]
-        plan.result_json = json.dumps(snap, ensure_ascii=False)
-        db.commit()
-    if same_cell and same_cell.candidate_id != body.candidate_id:
-        raise HTTPException(409, f"该格已锁定给考生 {same_cell.candidate_id}，一格只能锁一人")
+    # 不改写任何已落下的方案：新锁只影响下一次排座
     return {"ok": True, "candidate_id": body.candidate_id, "row": body.row, "col": body.col}
 
 
@@ -155,13 +156,5 @@ def remove_lock(candidate_id: int, hall_id: int = 1, db: Session = Depends(get_d
     if existing:
         db.delete(existing)
         db.commit()
-    plan = db.scalars(select(SeatPlan).where(SeatPlan.hall_id == hall_id).order_by(SeatPlan.id.desc())).first()
-    if plan:
-        snap = json.loads(plan.result_json)
-        live = _current_locks(db, hall_id)
-        snap["locks"] = [{"candidate_id": x.candidate_id, "row": x.row, "col": x.col} for x in live]
-        for row in snap.get("assignments") or []:
-            row["locked"] = row.get("candidate_id") in {x.candidate_id for x in live}
-        plan.result_json = json.dumps(snap, ensure_ascii=False)
-        db.commit()
+    # 已落下的方案快照保持原字：解锁只影响下一次排座
     return {"ok": True, "candidate_id": candidate_id, "unlocked": bool(existing)}

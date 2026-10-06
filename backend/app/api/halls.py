@@ -32,9 +32,6 @@ def update_hall(hall_id: int, body: HallUpdate, db: Session = Depends(get_db)):
         hall.min_manhattan = body.min_manhattan
     db.commit()
     db.refresh(hall)
-    try:
-        from app.api.seating import run_seating_plan
-        run_seating_plan(db, hall)
-    except Exception:
-        pass
+    # 改距不当场重排、不改写已落下的方案；新间距在下一次手动排座时生效，
+    # 若锁位在新间距下已不合法，那次排座整场失败（409）且方案数不增
     return _hall_dict(hall)

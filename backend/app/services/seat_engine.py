@@ -99,17 +99,18 @@ def place_candidates(rows: int, cols: int, min_dist: int, candidates: list[dict]
                      locks: list[Lock] | None = None) -> tuple[list[SeatAssign], list[dict]]:
     """Greedy: try seats row-major; accept if manhattan >= min_dist to all placed AND no same paper 4-neigh.
 
-    提供 locks 时：锁考生固定在原格（先预占），其余考生绕开锁格排座；
-    锁位不合法直接抛 PlacementError，绝不移动锁考生或把锁格分给别人。
+    提供 locks 时：先校验锁位（不合法抛 PlacementError，绝不拆锁硬排），
+    锁考生预占原格，其余考生绕开锁格、并与锁考生同样满足间距与同卷约束。
+    锁格绝不分给别人，锁考生绝不进 unplaced。
     """
     locks = locks or []
-    by_id = {c["id"]: c for c in candidates}
-    locked_ids = {lk.candidate_id for lk in locks}
+    locked = validate_locks(rows, cols, min_dist, candidates, locks)
     occupied: dict[tuple[int, int], SeatAssign] = {}
+    for assign in locked.values():
+        occupied[(assign.row, assign.col)] = assign
     unplaced: list[dict] = []
-    locked: dict[int, SeatAssign] = {}
     for cand in candidates:
-        if cand["id"] in locked_ids:
+        if cand["id"] in locked:
             continue
         placed = False
         for r in range(rows):
@@ -117,7 +118,7 @@ def place_candidates(rows: int, cols: int, min_dist: int, candidates: list[dict]
                 if (r, c) in occupied:
                     continue
                 ok = True
-                for pos, other in occupied.items():
+                for pos in occupied:
                     if manhattan((r, c), pos) < min_dist:
                         ok = False
                         break
@@ -129,23 +130,13 @@ def place_candidates(rows: int, cols: int, min_dist: int, candidates: list[dict]
                         break
                 if not ok:
                     continue
-                assign = _assign_for(cand, r, c, False)
-                occupied[(r, c)] = assign
+                occupied[(r, c)] = _assign_for(cand, r, c, False)
                 placed = True
                 break
             if placed:
                 break
         if not placed:
             unplaced.append(cand)
-    for lk in locks:
-        cand = by_id.get(lk.candidate_id)
-        if cand is None:
-            continue
-        if (lk.row, lk.col) in occupied and occupied[(lk.row, lk.col)].candidate_id != lk.candidate_id:
-            unplaced.append(cand)
-            continue
-        locked[lk.candidate_id] = _assign_for(cand, lk.row, lk.col, True)
-        occupied[(lk.row, lk.col)] = locked[lk.candidate_id]
     assigns = [locked[c["id"]] for c in candidates if c["id"] in locked]
     assigns += [a for a in occupied.values() if not a.locked]
     return assigns, unplaced
@@ -183,7 +174,7 @@ def plan_to_dict(assigns: list[SeatAssign], unplaced: list[dict], viols: list[Vi
             "seated": len(assigns),
             "unplaced": len(unplaced),
             "violations": len(viols),
-            "locked": 0,
+            "locked": len(locks),
             "capacity": rows * cols,
         },
     }
