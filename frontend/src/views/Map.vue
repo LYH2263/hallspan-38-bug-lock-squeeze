@@ -49,21 +49,22 @@ async function toggleLock(cell: any) {
   if (cell.empty || running.value) return
   const cid = cell.candidate_id
   if (lockMap.value.has(cid)) {
-    // 解锁：下一次排座才允许重排原格
-    await api(`/seating/locks/${cid}?hall_id=1`, { method: 'DELETE' })
-    const next = new Map(lockMap.value)
-    next.delete(cid)
-    lockMap.value = next
-    flash('ok', `已解锁 ${cell.name}，下次排座起可重排原格`)
+    // 解锁：下一次排座才允许重排原格，已落下的方案不动
+    try {
+      await api(`/seating/locks/${cid}?hall_id=1`, { method: 'DELETE' })
+      await loadLocks()
+      flash('ok', `已解锁 ${cell.name}，下次排座起可重排原格`)
+    } catch (e: any) {
+      flash('err', '解锁失败：' + (e.message || ''))
+    }
   } else {
     try {
       await api('/seating/locks?hall_id=1', {
         method: 'POST',
         body: JSON.stringify({ candidate_id: cid, row: cell.row, col: cell.col }),
       })
-      const next = new Map(lockMap.value)
-      next.set(cid, `${cell.row},${cell.col}`)
-      lockMap.value = next
+      // 以服务端锁名单为准回刷，保证名单/图/统计同一套数
+      await loadLocks()
       flash('ok', `已锁定 ${cell.name} 在 (${cell.row + 1},${cell.col + 1})，再排时不动`)
     } catch (e: any) {
       flash('err', '锁定失败：' + (e.message || '该格已被锁定'))
@@ -96,8 +97,9 @@ function isViol(cell: any) {
 }
 function isLocked(cell: any) {
   if (cell.empty) return false
-  // 以当前锁表为准；历史方案自带的 locked 标记兜底
-  return false
+  // 图上锁格以当前锁名单为准，与锁名单人数、统计锁定保持同一套数
+  const id = cell.candidate_id ?? cell.id
+  return id != null && lockMap.value.has(id)
 }
 function paperClass(pid: number) {
   return pid % 2 === 0 ? 'b' : 'a'

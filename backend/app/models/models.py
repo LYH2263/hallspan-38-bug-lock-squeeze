@@ -37,7 +37,8 @@ class SeatPlan(Base):
 class SeatLock(Base):
     """当前锁定：考生钉在指定格。锁属于"当前状态"，历史方案只存 result_json 快照。"""
     __tablename__ = "seat_locks"
-    __table_args__ = (UniqueConstraint("hall_id", "candidate_id", name="uq_lock_hall_candidate"),)
+    __table_args__ = (UniqueConstraint("hall_id", "candidate_id", name="uq_lock_hall_candidate"),
+                      UniqueConstraint("hall_id", "row", "col", name="uq_lock_hall_cell"),)
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     hall_id: Mapped[int] = mapped_column(ForeignKey("halls.id"))
     candidate_id: Mapped[int] = mapped_column(ForeignKey("candidates.id"))

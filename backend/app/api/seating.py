@@ -3,6 +3,7 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models.models import Candidate, Hall, SeatLock, SeatPlan
@@ -14,7 +15,6 @@ from app.services.seat_engine import (
     plan_to_dict,
 )
 
-from app.services.page_rollup import mix_stats, mix_violations
 router = APIRouter(prefix="/seating", tags=["seating"])
 
 
@@ -49,10 +49,10 @@ def _candidates(db: Session, hall_id: int) -> list[dict]:
 
 
 def run_seating_plan(db: Session, hall: Hall) -> dict:
-    """按当前锁位执行排座并落库一个新方案。
+    """按提交当下的锁名单执行排座并落库一个新方案。
 
-    锁位在当前约束下不合法时抛 PlacementError：整场失败、不写 SeatPlan，
-    绝不为了排其他人而拆掉锁位。
+    只看当前 SeatLock 表，不吃上一张图的锁印；锁位在当前约束下不合法时
+    抛 PlacementError：整场失败、不写 SeatPlan，绝不为了排其他人而拆掉锁位。
     """
     cands = _candidates(db, hall.id)
     locks = _current_locks(db, hall.id)
@@ -84,29 +84,25 @@ def latest(hall_id: int = 1, db: Session = Depends(get_db)):
     plan = db.scalars(select(SeatPlan).where(SeatPlan.hall_id == hall_id).order_by(SeatPlan.id.desc())).first()
     if not plan:
         return run_seating(hall_id=hall_id, db=db)
-    # 原样返回历史快照：当前锁表不得回刷历史方案上的锁标记
-    data = json.loads(plan.result_json)
-    live = _current_locks(db, hall_id)
-    data["locks"] = [{"candidate_id": x.candidate_id, "row": x.row, "col": x.col} for x in live]
-    live_ids = {x.candidate_id for x in live}
-    for row in data.get("assignments") or []:
-        row["locked"] = row.get("candidate_id") in live_ids
-    stats = dict(data.get("stats") or {})
-    stats["locked"] = len(live_ids)
-    data["stats"] = stats
-    return {"id": plan.id, **data}
+    # 原样返回历史快照：当前锁表不得回刷已落下方案上的锁标记与统计
+    return {"id": plan.id, **json.loads(plan.result_json)}
 
 
 @router.get("/violations")
 def violations(hall_id: int = 1, db: Session = Depends(get_db)):
     data = latest(hall_id=hall_id, db=db)
-    return {"hall_id": hall_id, **mix_violations(data)}
+    return {"hall_id": hall_id,
+            "violations": data.get("violations") or [],
+            "unplaced": data.get("unplaced") or []}
 
 
 @router.get("/stats")
 def stats(hall_id: int = 1, db: Session = Depends(get_db)):
     data = latest(hall_id=hall_id, db=db)
-    return {"hall_id": hall_id, **mix_stats(data)}
+    stats = dict(data.get("stats") or {})
+    # 锁定人数以当前锁表为准：锁名单、排座图锁格、统计锁定必须同一套数
+    stats["locked"] = len(_current_locks(db, hall_id))
+    return {"hall_id": hall_id, **stats}
 
 
 @router.get("/locks")
@@ -123,9 +119,12 @@ def add_lock(body: LockIn, hall_id: int = 1, db: Session = Depends(get_db)):
     _candidate_or_404(db, hall_id, body.candidate_id)
     if not (0 <= body.row < hall.rows and 0 <= body.col < hall.cols):
         raise HTTPException(422, f"格位 ({body.row},{body.col}) 越出 {hall.rows}x{hall.cols} 考室网格")
+    # 先校验后落库：任一检查失败，锁名单/排座图/统计都保持原样
     same_cell = db.scalars(
         select(SeatLock).where(SeatLock.hall_id == hall_id, SeatLock.row == body.row, SeatLock.col == body.col)
     ).first()
+    if same_cell and same_cell.candidate_id != body.candidate_id:
+        raise HTTPException(409, f"该格已锁定给考生 {same_cell.candidate_id}，一格只能锁一人")
     existing = db.scalars(
         select(SeatLock).where(SeatLock.hall_id == hall_id, SeatLock.candidate_id == body.candidate_id)
     ).first()
@@ -133,16 +132,12 @@ def add_lock(body: LockIn, hall_id: int = 1, db: Session = Depends(get_db)):
         existing.row, existing.col = body.row, body.col
     else:
         db.add(SeatLock(hall_id=hall_id, candidate_id=body.candidate_id, row=body.row, col=body.col))
-    db.commit()
-    plan = db.scalars(select(SeatPlan).where(SeatPlan.hall_id == hall_id).order_by(SeatPlan.id.desc())).first()
-    if plan:
-        snap = json.loads(plan.result_json)
-        live = _current_locks(db, hall_id)
-        snap["locks"] = [{"candidate_id": x.candidate_id, "row": x.row, "col": x.col} for x in live]
-        plan.result_json = json.dumps(snap, ensure_ascii=False)
+    try:
         db.commit()
-    if same_cell and same_cell.candidate_id != body.candidate_id:
-        raise HTTPException(409, f"该格已锁定给考生 {same_cell.candidate_id}，一格只能锁一人")
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "该格已锁定给他人，一格只能锁一人")
+    # 加锁只影响下一次排座：不回写任何已落下的方案
     return {"ok": True, "candidate_id": body.candidate_id, "row": body.row, "col": body.col}
 
 
@@ -155,13 +150,5 @@ def remove_lock(candidate_id: int, hall_id: int = 1, db: Session = Depends(get_d
     if existing:
         db.delete(existing)
         db.commit()
-    plan = db.scalars(select(SeatPlan).where(SeatPlan.hall_id == hall_id).order_by(SeatPlan.id.desc())).first()
-    if plan:
-        snap = json.loads(plan.result_json)
-        live = _current_locks(db, hall_id)
-        snap["locks"] = [{"candidate_id": x.candidate_id, "row": x.row, "col": x.col} for x in live]
-        for row in snap.get("assignments") or []:
-            row["locked"] = row.get("candidate_id") in {x.candidate_id for x in live}
-        plan.result_json = json.dumps(snap, ensure_ascii=False)
-        db.commit()
+    # 解锁只影响下一次排座：已落下的方案快照保持原样，不清锁标
     return {"ok": True, "candidate_id": candidate_id, "unlocked": bool(existing)}
